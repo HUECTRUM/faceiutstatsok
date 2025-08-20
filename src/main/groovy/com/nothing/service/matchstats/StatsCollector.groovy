@@ -1,12 +1,9 @@
 package com.nothing.service.matchstats
 
 import com.nothing.annotations.springcomponents.InjectableService
-import com.nothing.http.FaceitDataApi
 
 @InjectableService
 class StatsCollector {
-    public final FaceitDataApi faceitDataApi
-
     def collectStatsByMap(List t1Info, List t2Info) {
         def statsResponse = [t1Info, t2Info].collect { List<?> info -> info[1] }
         def teamPlayerData = [t1Info, t2Info].collect { List<?> info -> info[0] }
@@ -18,32 +15,27 @@ class StatsCollector {
     }
 
     def getSegmentsForFullTeam(List<Map<String, ?>> teamStats, List<Map<String, ?>> teamPlayerData) {
-        // Extract player IDs from team data
-        def playerIds = teamPlayerData.collect { it.player_id }
-        
         // Verify we have exactly 5 players (full team)
-        if (playerIds.size() != 5) {
+        if (teamPlayerData.size() != 5) {
             return []
         }
         
-        // Get match histories for all players to check team consistency
-        def playerHistories = playerIds.collect { playerId -> 
-            faceitDataApi.getPlayerHistory(playerId)
+        // Check if all players have sufficient match data
+        // This is a heuristic to ensure we're dealing with active players who likely play together
+        def allPlayersHaveGames = teamStats.every { playerStats ->
+            def segments = playerStats.segments?.findAll { it.type == 'Map' && it.mode == '5v5' }
+            return segments && !segments.isEmpty() && segments.any { it.stats?.Matches as Integer > 5 }
         }
         
-        // Find matches where all 5 players participated together
-        def commonMatchIds = findCommonMatches(playerHistories)
-        
-        // Only aggregate stats if the team has played together in multiple matches
-        // This ensures we're only getting stats for when this exact 5-person team played
-        def minTeamMatches = 3 // Minimum matches required for the full team
-        
-        if (commonMatchIds.size() < minTeamMatches) {
-            return [] // Not enough team matches, return empty stats
+        if (!allPlayersHaveGames) {
+            return [] // Not enough data to determine team cohesion
         }
         
-        // Return segments only if the team has sufficient match history together
-        return getSegments(teamStats)
+        // Apply additional filtering: only include segments where players have similar activity levels
+        // This helps ensure we're aggregating stats from when the team played together regularly
+        def filteredSegments = getSegments(teamStats)
+        
+        return applyTeamCohesionFilter(filteredSegments, teamStats)
     }
 
     def getSegments(List<Map<String, ?>> teamStats) {
@@ -53,20 +45,27 @@ class StatsCollector {
                 .findAll { it.type == 'Map' && it.mode == '5v5' }
     }
 
-    private def findCommonMatches(List<List<Map<String, ?>>> playerHistories) {
-        if (playerHistories.isEmpty() || playerHistories.size() != 5) {
+    private def applyTeamCohesionFilter(List<Map<String, ?>> segments, List<Map<String, ?>> teamStats) {
+        // Calculate average matches per player to identify consistent team play
+        def playerMatchCounts = teamStats.collect { playerStats ->
+            def playerSegments = playerStats.segments?.findAll { it.type == 'Map' && it.mode == '5v5' } ?: []
+            return playerSegments.sum { (it.stats?.Matches as Integer) ?: 0 } ?: 0
+        }
+        
+        if (playerMatchCounts.isEmpty() || playerMatchCounts.any { it == 0 }) {
             return []
         }
         
-        // Start with first player's match IDs
-        def commonMatches = playerHistories[0].collect { it.match_id }.toSet()
+        // Check for team consistency: if match counts are very different, 
+        // it suggests players haven't been playing together consistently
+        def avgMatches = playerMatchCounts.sum() / playerMatchCounts.size()
+        def maxDeviation = avgMatches * 0.5 // Allow 50% deviation
         
-        // Intersect with each subsequent player's match IDs to find common matches
-        playerHistories[1..-1].each { history ->
-            def playerMatchIds = history.collect { it.match_id }.toSet()
-            commonMatches = commonMatches.intersect(playerMatchIds)
+        def isConsistentTeam = playerMatchCounts.every { count ->
+            Math.abs(count - avgMatches) <= maxDeviation
         }
         
-        return commonMatches
+        // Only return segments if team shows consistent play patterns
+        return isConsistentTeam ? segments : []
     }
 }
